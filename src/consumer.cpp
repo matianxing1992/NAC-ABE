@@ -125,7 +125,7 @@ Consumer::consume(const Interest& dataInterest,
   auto dataCallback = [=] (const Interest&, const Data& data) {
     Name dataName = data.getName();
     // if segmentation
-    if (dataName.get(-1).isSegment()) {  
+    if (dataName.get(-1).isSegment()) {
       ndn::SegmentFetcher::Options fetchOptions;
       fetchOptions.probeLatestVersion = false; // Disable MustBeFresh flag
       auto fetcher = SegmentFetcher::start(m_face, dataInterest, m_validator, fetchOptions);
@@ -330,7 +330,7 @@ Consumer::decryptContent(const Name& dataObjName,
       }
       m_ckInterestsSent.erase(ckName);
     };
-
+    // probe segmentation
     NDN_LOG_INFO(m_cert.getIdentity() << " Ask for data " << ckInterest.getName() );
     m_face.expressInterest(ckInterest,
                            dataCallback,
@@ -343,7 +343,6 @@ Consumer::decryptContent(const Name& dataObjName,
     m_pendingCallbacks[ckName].push_back(PendingTask{cipherText, successCallBack, errorCallback});
   }
 }
-
 
 void
 Consumer::onCkeyData(const Name& ckObjName, const Block& content,

@@ -101,7 +101,7 @@ public:
   consume(const Name& dataName,
           const Block& dataBlock,
           const ConsumptionCallback& consumptionCb,
-          const ErrorCallback& errorCallback); 
+          const ErrorCallback& errorCallback);  
 
   /**
    * @brief Set the maximum number of retries for fetching data packets.
