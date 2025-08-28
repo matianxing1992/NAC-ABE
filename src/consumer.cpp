@@ -125,8 +125,10 @@ Consumer::consume(const Interest& dataInterest,
   auto dataCallback = [=] (const Interest&, const Data& data) {
     Name dataName = data.getName();
     // if segmentation
-    if (dataName.get(-1).isSegment()) {
-      auto fetcher = SegmentFetcher::start(m_face, dataInterest, m_validator);
+    if (dataName.get(-1).isSegment()) {  
+      ndn::SegmentFetcher::Options fetchOptions;
+      fetchOptions.probeLatestVersion = false; // Disable MustBeFresh flag
+      auto fetcher = SegmentFetcher::start(m_face, dataInterest, m_validator, fetchOptions);
       fetcher->afterSegmentValidated.connect([](Data seg) {
         NDN_LOG_DEBUG("Validated " << seg.getName());
       });
@@ -204,6 +206,26 @@ Consumer::decryptContent(const Name& dataObjName,
 
   Name ckName(content.get(tlv::Name));
   NDN_LOG_INFO("CK Name is " << ckName);
+
+  //if this CK's encrypted AES is cached, skip network and decrypt data
+  std::unordered_map<ndn::Name, ndn::Buffer>::const_iterator it = m_ckEncAesCache.find(ckName);
+  if (it != m_ckEncAesCache.end()) {
+    NDN_LOG_DEBUG("CK encAES cache hit for " << ckName);
+    cipherText->m_contentKey = std::make_shared<algo::ContentKey>();
+    cipherText->m_contentKey->m_encAesKey = it->second;
+    try {
+      Buffer result;
+      if (m_paramFetcher.getAbeType() == ABE_TYPE_CP_ABE)
+        result = algo::ABESupport::getInstance().cpDecrypt(m_paramFetcher.getPublicParams(), m_keyCache, *cipherText);
+      else if (m_paramFetcher.getAbeType() == ABE_TYPE_KP_ABE)
+        result = algo::ABESupport::getInstance().kpDecrypt(m_paramFetcher.getPublicParams(), m_keyCache, *cipherText);
+      else { errorCallback("Unsupported ABE type"); return; }
+      successCallBack(result);
+    }
+    catch (const std::exception& e) { errorCallback(e.what()); }
+    return;
+  }
+
   Interest ckInterest(ckName);
   ckInterest.setInterestLifetime(ndn::time::milliseconds(m_defaultTimeout));
   ckInterest.setCanBePrefix(true);
@@ -215,16 +237,47 @@ Consumer::decryptContent(const Name& dataObjName,
     Name dataName = data.getName();
     // if segmentation
     if (dataName.get(-1).isSegment()) {
-      auto fetcher = SegmentFetcher::start(m_face, ckInterest, m_validator);
+      ndn::SegmentFetcher::Options fetchOptions;
+      fetchOptions.probeLatestVersion = false; // Disable MustBeFresh flag
+      auto fetcher = SegmentFetcher::start(m_face, ckInterest, m_validator, fetchOptions);
+
       fetcher->afterSegmentValidated.connect([](Data seg) {
         NDN_LOG_DEBUG("Validated " << seg.getName());
       });
       fetcher->onComplete.connect([=] (ConstBufferPtr contentBuffer) {
         NDN_LOG_DEBUG("SegmentFetcher completed with total fetched size of " << contentBuffer->size());
-        onCkeyData(dataName.getPrefix(-1), Block(contentBuffer), cipherText, successCallBack, errorCallback);
+        Name ckObjName = dataName.getPrefix(-1);
+        Block ckBlock(contentBuffer);
+        // Cache encrypted AES so future data with same CK skip the network entirely
+        try {
+          ckBlock.parse();
+          Block encTLV = ckBlock.get(TLV_EncryptedAesKey);
+          m_ckEncAesCache[ckObjName] = Buffer(encTLV.value(), encTLV.value_size());
+        }
+        catch (const std::exception& e) {
+              NDN_LOG_WARN("CK cache fill skipped: " << e.what());
+            } 
+        // complete all queued tasks  waiting on this CK remove from pending callback or ck sent
+        auto it = m_pendingCallbacks.find(ckName);
+        if (it != m_pendingCallbacks.end()) {
+           for (const auto& t : it->second) {
+              onCkeyData(ckObjName, ckBlock, t.cipher, t.onSuccess, t.onError);
+           }
+          m_pendingCallbacks.erase(it);
+        }
+        m_ckInterestsSent.erase(ckName);
       });
-      fetcher->onError.connect([] (uint32_t errorCode, const std::string& errorMsg) {
-        NDN_LOG_ERROR("Error occurs in segment fetching: " << errorMsg);
+      //send error for each data
+      fetcher->onError.connect([this, ckName] (uint32_t errorCode, const std::string& errorMsg) {
+        NDN_LOG_ERROR("Error occurs in segment fetching decrypt content: " << errorMsg);
+        auto it = m_pendingCallbacks.find(ckName);
+        if (it != m_pendingCallbacks.end()) {
+         for (const auto& t : it->second) {
+          if (t.onError) t.onError(errorMsg);
+          }
+          m_pendingCallbacks.erase(it);
+        }
+        m_ckInterestsSent.erase(ckName);
       });
     }
     // if no segmentation
@@ -232,7 +285,26 @@ Consumer::decryptContent(const Name& dataObjName,
       m_validator.validate(data,
         [=] (const Data& data) {
           NDN_LOG_INFO("Content key conforms to trust schema");
-          onCkeyData(data.getName(), data.getContent(), cipherText, successCallBack, errorCallback);
+          Name ckObjName = data.getName();
+          Block ckBlock = data.getContent();
+          // Cache encrypted AES for decrypt later
+          try {
+            ckBlock.parse();
+            Block encTLV = ckBlock.get(TLV_EncryptedAesKey);
+            m_ckEncAesCache[ckObjName] = Buffer(encTLV.value(), encTLV.value_size());
+          }
+          catch (const std::exception& e) {
+              NDN_LOG_WARN("CK cache fill skipped: " << e.what());
+            }
+          // complete all queued tasks for this CK
+          auto it = m_pendingCallbacks.find(ckName);
+          if (it != m_pendingCallbacks.end()) {
+            for (const auto& t : it->second) {
+              onCkeyData(ckObjName, ckBlock, t.cipher, t.onSuccess, t.onError);
+            }
+            m_pendingCallbacks.erase(it);
+          }
+          m_ckInterestsSent.erase(ckName);
         },
         [] (auto&&, const ndn::security::ValidationError& error) {
           NDN_THROW(std::runtime_error("Fetched content key cannot be authenticated: " + error.getInfo()));
@@ -241,14 +313,37 @@ Consumer::decryptContent(const Name& dataObjName,
     }
   };
 
-  // probe segmentation
-  NDN_LOG_INFO(m_cert.getIdentity() << " Ask for data " << ckInterest.getName());
-  m_face.expressInterest(ckInterest,
-                         dataCallback,
-                         std::bind(&Consumer::handleNack, this, _1, _2, errorCallback, nackMessage),
-                         std::bind(&Consumer::handleTimeout, this, _1, m_maxRetries,
-                                   dataCallback, errorCallback, nackMessage, timeoutMessage));
+  //Only one CK Interest at a time, queue everyone else behind
+  if (m_ckInterestsSent.count(ckName) == 0) {
+    m_ckInterestsSent.insert(ckName);
+    m_pendingCallbacks[ckName].push_back(PendingTask{cipherText, successCallBack, errorCallback});
+
+    // Wrap errors so all queued ck are notified
+    ErrorCallback broadcastErr = [this, ckName, errorCallback] (const std::string& msg) {
+      errorCallback(msg);
+      auto it = m_pendingCallbacks.find(ckName);
+      if (it != m_pendingCallbacks.end()) {
+        for (const auto& t : it->second) {
+          if (t.onError) t.onError(msg);
+        }
+        m_pendingCallbacks.erase(it);
+      }
+      m_ckInterestsSent.erase(ckName);
+    };
+
+    NDN_LOG_INFO(m_cert.getIdentity() << " Ask for data " << ckInterest.getName() );
+    m_face.expressInterest(ckInterest,
+                           dataCallback,
+                           std::bind(&Consumer::handleNack, this, _1, _2, broadcastErr, nackMessage),
+                           std::bind(&Consumer::handleTimeout, this, _1, m_maxRetries,
+                                     dataCallback, broadcastErr, nackMessage, timeoutMessage));
+  }
+  else {
+    NDN_LOG_DEBUG("CK interest already sent for " << ckName);
+    m_pendingCallbacks[ckName].push_back(PendingTask{cipherText, successCallBack, errorCallback});
+  }
 }
+
 
 void
 Consumer::onCkeyData(const Name& ckObjName, const Block& content,
