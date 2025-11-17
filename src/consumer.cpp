@@ -240,7 +240,6 @@ Consumer::decryptContent(const Name& dataObjName,
       ndn::SegmentFetcher::Options fetchOptions;
       fetchOptions.probeLatestVersion = false; // Disable MustBeFresh flag
       auto fetcher = SegmentFetcher::start(m_face, ckInterest, m_validator, fetchOptions);
-
       fetcher->afterSegmentValidated.connect([](Data seg) {
         NDN_LOG_DEBUG("Validated " << seg.getName());
       });
