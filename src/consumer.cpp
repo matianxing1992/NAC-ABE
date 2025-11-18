@@ -186,7 +186,8 @@ Consumer::decryptContent(const Name& dataObjName,
   NDN_LOG_INFO(m_cert.getIdentity() << " Get content data " << dataObjName);
   content.parse();
   auto encryptedContentTLV = content.get(TLV_EncryptedContent);
-
+  
+  NDN_LOG_INFO("Encrypted Content size is " << encryptedContentTLV.value_size());
   auto cipherText = std::make_shared<algo::CipherText>();
   cipherText->m_content = Buffer(encryptedContentTLV.value(), encryptedContentTLV.value_size());
   cipherText->m_plainTextSize = readNonNegativeInteger(content.get(TLV_PlainTextSize));
@@ -261,7 +262,7 @@ Consumer::decryptContent(const Name& dataObjName,
     }
     m_ckInterestsSent.erase(ckKey);
   });
-  ckFetcher->onError.connect([=](uint32_t /*code*/, const std::string& errorMsg) {
+  ckFetcher->onError.connect([=](uint32_t errorCode, const std::string& errorMsg) {
     NDN_LOG_ERROR("CK fetch error: " << errorMsg);
     // Broadcast error to all waiters
     auto it = m_pendingCallbacks.find(ckKey);
@@ -288,6 +289,9 @@ Consumer::onCkeyData(const Name& ckObjName, const Block& content,
   cipherText->m_contentKey = std::make_shared<algo::ContentKey>();
   cipherText->m_contentKey->m_encAesKey = Buffer(encryptedAESKeyTLV.value(), encryptedAESKeyTLV.value_size());
 
+  NDN_LOG_INFO("Content size : " << cipherText->m_content.size());
+  NDN_LOG_INFO("Plaintext size : " << cipherText->m_plainTextSize);
+  NDN_LOG_INFO("Encrypted aes key size : " << cipherText->m_contentKey->m_encAesKey.size());
   try {
     Buffer result;
     if (m_paramFetcher.getAbeType() == ABE_TYPE_CP_ABE)
@@ -298,6 +302,7 @@ Consumer::onCkeyData(const Name& ckObjName, const Block& content,
       errorCallback("Unsupported ABE type");
       return;
     }
+    NDN_LOG_INFO("Result length : " << result.size());
     successCallBack(result);
   }
   catch (const std::exception& e) {
@@ -309,7 +314,6 @@ void
 Consumer::handleNack(const Interest& interest, const lp::Nack& nack,
                      const ErrorCallback& errorCallback, std::string message)
 {
-  NDN_LOG_DEBUG("In handle nack "<< interest);
   std::stringstream nackMessage;
   nackMessage << message << nack.getReason();
   errorCallback(nackMessage.str());
