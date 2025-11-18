@@ -1,0 +1,85 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright (c) 2017-2022, Regents of the University of California.
+ *
+ * This file is part of NAC-ABE.
+ *
+ * NAC-ABE is free software: you can redistribute it and/or modify it under the terms
+ * of the GNU General Public License as published by the Free Software Foundation, either
+ * version 3 of the License, or (at your option) any later version.
+ *
+ * NAC-ABE is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ * PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ *
+ * You should have received copies of the GNU General Public License along with
+ * NAC-ABE, e.g., in COPYING.md file.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * See AUTHORS.md for complete list of NAC-ABE authors and contributors.
+ */
+
+#ifndef NAC_ABE_PARAM_FETCHER_HPP
+#define NAC_ABE_PARAM_FETCHER_HPP
+
+#include "common.hpp"
+#include "algo/public-params.hpp"
+#include "trust-config.hpp"
+
+namespace ndn {
+namespace nacabe {
+
+/**
+ * @brief Internal class for fetching parameters.
+ */
+class ParamFetcher
+{
+public:
+  ParamFetcher(Face& face, security::Validator& validator,
+               const Name& attrAuthorityPrefix, const TrustConfig& trustConfig,
+               Interest interestTemplate = getDefaultInterestTemplate());
+
+  void
+  fetchPublicParams();
+
+  AbeType
+  getAbeType() const
+  {
+    return m_abeType;
+  }
+
+  algo::PublicParams
+  getPublicParams() const
+  {
+    return m_pubParamsCache;
+  }
+
+public:
+  static inline Interest getDefaultInterestTemplate() {
+    Interest interest;
+    interest.setMustBeFresh(true);
+    interest.setCanBePrefix(true);
+    return interest;
+  }
+
+private:
+  void
+  onAttributePubParams(const Data& pubParamData);
+
+private:
+  Face& m_face;
+  security::Validator& m_validator;
+  const Name& m_attrAuthorityPrefix;
+  const TrustConfig& m_trustConfig;
+  int m_retryCount = 0;
+  const int MAX_RETRIES = 10;
+
+PUBLIC_WITH_TESTS_ELSE_PRIVATE:
+  AbeType m_abeType;
+  algo::PublicParams m_pubParamsCache;
+  Interest m_interestTemplate;
+};
+
+} // namespace nacabe
+} // namespace ndn
+
+#endif // NAC_ABE_PARAM_FETCHER_HPP
