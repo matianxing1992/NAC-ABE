@@ -27,6 +27,10 @@
 
 #include "test-common.hpp"
 
+#include <chrono>
+#include <future>
+
+
 #include <ndn-cxx/util/dummy-client-face.hpp>
 
 namespace ndn {
@@ -562,6 +566,294 @@ BOOST_AUTO_TEST_CASE(KpCache)
   advanceClocks(time::milliseconds(20), 60);
   BOOST_CHECK(isConsumeCbCalled);
 }
+
+BOOST_AUTO_TEST_CASE(KpCacheProducerEncryptDecryptBenchmark1000_ExistingPolicy)
+{
+  constexpr int N = 1000;
+
+  auto buffersEqual = [](const Buffer& b, const uint8_t* ref, size_t refLen) -> bool {
+    return b.size() == refLen && std::memcmp(b.data(), ref, refLen) == 0;
+  };
+
+  // =========================================================
+  // 1) Setup AA (KP-ABE) -- exactly like old integrated test
+  // =========================================================
+  security::ValidatorConfig validatorAA(aaFace);
+  validatorAA.load("trust-schema.conf");
+  KpAttributeAuthority aa(aaCert, aaFace, validatorAA, m_keyChain);
+  advanceClocks(time::milliseconds(20), 60);
+
+  Policy policyForConsumer1 = "cs and homework"; // existing policy
+  aa.addNewPolicy(consumerCert1, policyForConsumer1);
+  BOOST_REQUIRE_EQUAL(aa.m_tokens.size(), 1);
+
+  Policy policyForConsumer2 = "cs";
+  aa.addNewPolicy(consumerCert2, policyForConsumer2);
+  BOOST_REQUIRE_EQUAL(aa.m_tokens.size(), 2);
+
+  // =========================================================
+  // 2) Setup Consumer1 (DO NOT change linkTo topology)
+  //    Mimic old test: create, then receive aaCert + anchorCert, then check m_pub.
+  // =========================================================
+  security::ValidatorConfig validatorC1(consumerFace1);
+  validatorC1.load("trust-schema.conf");
+  Consumer consumer1(consumerFace1, m_keyChain, validatorC1, consumerCert1, aaCert);
+
+  advanceClocks(time::milliseconds(20), 60);
+  consumerFace1.receive(aaCert);
+  advanceClocks(time::milliseconds(20), 60);
+  consumerFace1.receive(anchorCert);
+  advanceClocks(time::milliseconds(20), 60);
+
+  BOOST_REQUIRE_MESSAGE(consumer1.m_paramFetcher.getPublicParams().m_pub != "",
+                        "Consumer failed to fetch/validate AA public parameters. "
+                        "Check trust-schema + cert delivery.");
+
+  // =========================================================
+  // 3) Setup CacheProducer (like old test)
+  // =========================================================
+  security::ValidatorConfig validatorP(producerFace);
+  validatorP.load("trust-schema.conf");
+  CacheProducer producer(producerFace, m_keyChain, validatorP, producerCert, aaCert, dataOwnerCert);
+
+  advanceClocks(time::milliseconds(20), 60);
+  producerFace.receive(aaCert);
+  advanceClocks(time::milliseconds(20), 60);
+  producerFace.receive(anchorCert);
+  advanceClocks(time::milliseconds(20), 60);
+
+  BOOST_REQUIRE(producer.m_paramFetcher.getPublicParams().m_pub != "");
+
+  // =========================================================
+  // 4) Setup DataOwner: set ciphertext attributes (match policy)
+  // =========================================================
+  DataOwner dataOwner(dataOwnerCert, dataOwnerFace, m_keyChain);
+  advanceClocks(time::milliseconds(20), 60);
+
+  const std::vector<std::string> attrs = {"cs", "homework"};
+  Name baseDataName = "/dataName";
+
+  bool isPolicySet = false;
+  dataOwner.commandProducerPolicy(producerCert.getIdentity(), baseDataName, attrs,
+    [&] (const Data& response) {
+      isPolicySet = true;
+      BOOST_REQUIRE_EQUAL(readString(response.getContent()), "success");
+    },
+    [] (const std::string&) {
+      BOOST_FAIL("commandProducerPolicy failed");
+    }
+  );
+
+  advanceClocks(time::milliseconds(20), 60);
+  BOOST_REQUIRE(isPolicySet);
+
+  auto attributeFound = producer.findMatchedAttributes(baseDataName);
+  BOOST_REQUIRE(!attributeFound.empty());
+
+  // =========================================================
+  // 5) Encrypt benchmark: produce N unique names + build lookup tables
+  // =========================================================
+  std::unordered_map<std::string, std::shared_ptr<ndn::Data>> exactDataByName;
+  std::unordered_map<std::string, std::shared_ptr<ndn::Data>> probeDataByPrefix;
+
+  // warmup (not counted)
+  {
+    SPtrVector<ndn::Data> wContent, wCk;
+    std::tie(wContent, wCk) = producer.produce(Name(baseDataName).append("warmup"),
+                                               attributeFound, PLAIN_TEXT, signingInfo);
+    BOOST_REQUIRE(!wContent.empty());
+    BOOST_REQUIRE(!wCk.empty());
+  }
+
+  long long encTotalUs = 0;
+  size_t encSink = 0;
+
+  for (int i = 0; i < N; ++i) {
+    Name dataName = Name(baseDataName).appendNumber(static_cast<uint64_t>(i));
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    SPtrVector<ndn::Data> contentData, ckData;
+    std::tie(contentData, ckData) = producer.produce(dataName, attributeFound, PLAIN_TEXT, signingInfo);
+
+    auto t1 = std::chrono::steady_clock::now();
+    encTotalUs += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    BOOST_REQUIRE(!contentData.empty());
+    BOOST_REQUIRE(!ckData.empty());
+    encSink += contentData.size() + ckData.size();
+
+    for (auto& seg : contentData) {
+      exactDataByName.emplace(seg->getName().toUri(), seg);
+      probeDataByPrefix.emplace(seg->getName().getPrefix(-1).toUri(), seg);
+    }
+    exactDataByName.emplace(ckData.at(0)->getName().toUri(), ckData.at(0));
+    probeDataByPrefix.emplace(ckData.at(0)->getName().getPrefix(-1).toUri(), ckData.at(0));
+  }
+
+  const double encAvgUs = encTotalUs / static_cast<double>(N);
+  BOOST_TEST_MESSAGE("KP-ABE Encrypt (CacheProducer::produce, attrs={cs,homework}) avg over "
+                     << N << " runs: " << encAvgUs << " us (sink=" << encSink << ")");
+  BOOST_TEST_MESSAGE("CacheProducer kpKeyCache size after encrypt bench: " << producer.m_kpKeyCache.size());
+
+  // =========================================================
+  // 6) Producer InterestFilter: serve certificates + content/ck
+  //    IMPORTANT: also serve AA cert fetch, not just producer cert fetch
+  // =========================================================
+  const ndn::Name producerKeyPrefix = producerCert.getIdentity().append("KEY");
+  const ndn::Name aaKeyPrefix       = aaCert.getIdentity().append("KEY");
+  const ndn::Name anchorKeyPrefix   = anchorCert.getIdentity().append("KEY");
+
+  producerFace.setInterestFilter(Name("/"),
+    [&] (const ndn::InterestFilter&, const ndn::Interest& interest) {
+      const ndn::Name& in = interest.getName();
+
+      // Serve cert chain requests for producer / AA / anchor
+      if (producerKeyPrefix.isPrefixOf(in)) {
+        producerFace.put(producerCert);
+        return;
+      }
+      if (aaKeyPrefix.isPrefixOf(in)) {
+        producerFace.put(aaCert);
+        return;
+      }
+      if (anchorKeyPrefix.isPrefixOf(in)) {
+        producerFace.put(anchorCert);
+        return;
+      }
+
+      // Serve content/ck
+      const std::string inUri = in.toUri();
+
+      auto itExact = exactDataByName.find(inUri);
+      if (itExact != exactDataByName.end()) {
+        producerFace.put(*itExact->second);
+        return;
+      }
+
+      if (interest.getCanBePrefix()) {
+        auto itProbe = probeDataByPrefix.find(inUri);
+        if (itProbe != probeDataByPrefix.end()) {
+          producerFace.put(*itProbe->second);
+          return;
+        }
+      }
+
+      // fallback prefix scan (rare)
+      for (const auto& kv : exactDataByName) {
+        const std::string& dataNameUri = kv.first;
+        if (dataNameUri.size() >= inUri.size() && dataNameUri.compare(0, inUri.size(), inUri) == 0) {
+          producerFace.put(*kv.second);
+          return;
+        }
+      }
+    }
+  );
+
+  // Also pre-feed certs (old style)
+  consumerFace1.receive(producerCert);
+  advanceClocks(time::milliseconds(20), 60);
+  consumerFace1.receive(aaCert);
+  advanceClocks(time::milliseconds(20), 60);
+  consumerFace1.receive(anchorCert);
+  advanceClocks(time::milliseconds(20), 60);
+
+  // =========================================================
+  // 7) Obtain DKEY (key fetch), with bounded pumping
+  // =========================================================
+  consumer1.obtainDecryptionKey();
+  for (int i = 0; i < 10; ++i) {
+    advanceClocks(time::milliseconds(20), 60);
+  }
+
+  // =========================================================
+  // 8) Decrypt benchmark: bounded pumps, progress prints
+  // =========================================================
+  long long decTotalUs = 0;
+  int successCount = 0;
+  int failCount = 0;
+
+  auto consumeOnceUs = [&](const Name& dataName, bool verify) -> long long {
+    // ndn::nacabe::algo::ABESupport::getInstance().clearCachedContentKeys();
+
+    bool called = false;
+    bool ok = false;
+    bool verified = true;
+    std::string errMsg;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    consumer1.consume(producerCert.getIdentity().append(dataName),
+      [&] (const Buffer& result) {
+        called = true;
+        ok = true;
+        if (verify) {
+          verified = buffersEqual(result, PLAIN_TEXT, sizeof(PLAIN_TEXT));
+        }
+      },
+      [&] (const std::string& err) {
+        called = true;
+        ok = false;
+        errMsg = err;
+      });
+
+    // bounded pumps
+    for (int spin = 0; spin < 12 && !called; ++spin) {
+      advanceClocks(time::milliseconds(1), 1);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+
+    if (!called) {
+      ++failCount;
+      BOOST_TEST_MESSAGE("consume timeout name=" << dataName.toUri());
+      return 0;
+    }
+    if (!ok) {
+      ++failCount;
+      BOOST_TEST_MESSAGE("consume error: " << errMsg);
+      return 0;
+    }
+    if (verify && !verified) {
+      ++failCount;
+      BOOST_TEST_MESSAGE("plaintext mismatch name=" << dataName.toUri());
+      return 0;
+    }
+
+    return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  };
+
+  // warmup decrypt a few
+  for (int i = 0; i < 5; ++i) {
+    Name dn = Name(baseDataName).appendNumber(static_cast<uint64_t>(i));
+    (void)consumeOnceUs(dn, true);
+  }
+
+  for (int i = 0; i < N; ++i) {
+    if (i % 100 == 0) {
+      BOOST_TEST_MESSAGE("decrypt progress: " << i << "/" << N);
+    }
+    Name dn = Name(baseDataName).appendNumber(static_cast<uint64_t>(i));
+    const bool verify = (i < 3) || (i % 200 == 0) || (i == N - 1);
+
+    auto us = consumeOnceUs(dn, verify);
+    if (us > 0) {
+      decTotalUs += us;
+      ++successCount;
+    }
+  }
+
+  BOOST_TEST_MESSAGE("decrypt successCount=" << successCount << " failCount=" << failCount);
+  BOOST_CHECK_EQUAL(failCount, 0);
+
+  if (successCount > 0) {
+    const double decAvgUs = decTotalUs / static_cast<double>(successCount);
+    BOOST_TEST_MESSAGE("KP-ABE Decrypt avg over " << successCount << " successful runs: "
+                       << decAvgUs << " us");
+  }
+}
+
+
 
 BOOST_AUTO_TEST_SUITE_END()
 

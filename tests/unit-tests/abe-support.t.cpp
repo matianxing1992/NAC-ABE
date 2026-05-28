@@ -217,6 +217,108 @@ BOOST_AUTO_TEST_CASE(DecryptWithCache)
   BOOST_CHECK_EQUAL_COLLECTIONS(result2.begin(), result2.end(), plain, plain + sizeof(plain));
 }
 
+BOOST_AUTO_TEST_CASE(KpBenchmark_AlgoOnly_EncryptDecrypt1000)
+{
+  constexpr int N = 1000;
+
+  // --------------------------------------------------
+  // 1) KP-ABE setup
+  // --------------------------------------------------
+  PublicParams pubParams;
+  MasterKey masterKey;
+  ABESupport::getInstance().kpInit(pubParams, masterKey);
+  BOOST_REQUIRE(!pubParams.m_pub.empty());
+  BOOST_REQUIRE(!masterKey.m_msk.empty());
+
+  // Decryption key (policy)
+  const std::string policy = "(cs or math) and homework";
+  PrivateKey prvKey =
+    ABESupport::getInstance().kpPrvKeyGen(pubParams, masterKey, policy);
+  BOOST_REQUIRE(!prvKey.m_prv.empty());
+
+  // Encryption attributes (must satisfy policy)
+  const std::vector<std::string> attrs = {"cs", "homework"};
+
+  // Plaintext: simulate a content key (32 bytes)
+  uint8_t plain[32];
+  random::generateSecureBytes(plain);
+  Buffer plainBuf(plain, sizeof(plain));
+
+  // --------------------------------------------------
+  // 2) Warmup (important!)
+  // --------------------------------------------------
+  for (int i = 0; i < 50; ++i) {
+    auto ct = ABESupport::getInstance().kpEncrypt(pubParams, attrs, plainBuf);
+    auto out = ABESupport::getInstance().kpDecrypt(pubParams, prvKey, ct);
+    BOOST_REQUIRE_EQUAL_COLLECTIONS(out.begin(), out.end(),
+                                    plain, plain + sizeof(plain));
+  }
+
+  // --------------------------------------------------
+  // 3) Encrypt benchmark (kpEncrypt only)
+  // --------------------------------------------------
+  long long encTotalUs = 0;
+  volatile uint64_t encSink = 0;
+
+  for (int i = 0; i < N; ++i) {
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto ct = ABESupport::getInstance().kpEncrypt(pubParams, attrs, plainBuf);
+
+    auto t1 = std::chrono::steady_clock::now();
+    encTotalUs +=
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // Prevent optimization: touch ciphertext indirectly
+    encSink += static_cast<uint64_t>(i);
+  }
+
+  BOOST_TEST_MESSAGE(
+    "KP-ABE Encrypt (ABESupport::kpEncrypt) avg over "
+    << N << " runs: "
+    << (encTotalUs / static_cast<double>(N))
+    << " us (sink=" << encSink << ")");
+
+  // --------------------------------------------------
+  // 4) Prepare ciphertexts for decrypt-only benchmark
+  // --------------------------------------------------
+  std::vector<CipherText> cts;
+  cts.reserve(N);
+  for (int i = 0; i < N; ++i) {
+    cts.emplace_back(
+      ABESupport::getInstance().kpEncrypt(pubParams, attrs, plainBuf));
+  }
+
+  // --------------------------------------------------
+  // 5) Decrypt benchmark (kpDecrypt only)
+  // --------------------------------------------------
+  long long decTotalUs = 0;
+  volatile uint64_t decSink = 0;
+
+  for (int i = 0; i < N; ++i) {
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto out = ABESupport::getInstance().kpDecrypt(pubParams, prvKey, cts[i]);
+
+    auto t1 = std::chrono::steady_clock::now();
+    decTotalUs +=
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // correctness
+    BOOST_REQUIRE_EQUAL_COLLECTIONS(out.begin(), out.end(),
+                                    plain, plain + sizeof(plain));
+
+    // sink: use decrypted buffer size
+    decSink += out.size();
+  }
+
+  BOOST_TEST_MESSAGE(
+    "KP-ABE Decrypt (ABESupport::kpDecrypt) avg over "
+    << N << " runs: "
+    << (decTotalUs / static_cast<double>(N))
+    << " us (sink=" << decSink << ")");
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()
 
