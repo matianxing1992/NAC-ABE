@@ -34,8 +34,12 @@ const char* ABESupport::SCHEMA_KPABE = "KP-ABE";
 ABESupport&
 ABESupport::getInstance()
 {
-  static ABESupport instance;
-  return instance;
+  // OpenABE/RELIC global cleanup is not safe in all embedding contexts
+  // (notably Python extension teardown after worker threads have been used).
+  // Keep the singleton alive until process exit and let the OS reclaim the
+  // library state instead of running ShutdownOpenABE from a static destructor.
+  static ABESupport* instance = new ABESupport();
+  return *instance;
 }
 
 ABESupport::ABESupport()
