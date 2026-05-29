@@ -45,12 +45,15 @@ class TestIntegratedFixture : public IdentityManagementTimeFixture
 {
 public:
   TestIntegratedFixture()
-    : producerFace(io, m_keyChain, {false, true})
-    , aaFace(io, m_keyChain, {false, true})
-    , tokenIssuerFace(io, m_keyChain, {false, true})
-    , consumerFace1(io, m_keyChain, {false, true})
-    , consumerFace2(io, m_keyChain, {false, true})
-    , dataOwnerFace(io, m_keyChain, {false, true})
+    // Keep packet logging enabled, matching the other DummyClientFace-based
+    // tests. Current ndn-cxx DummyClientFace uses this test-side bookkeeping
+    // in the manual receive/validation flows exercised below.
+    : producerFace(io, m_keyChain, {true, true})
+    , aaFace(io, m_keyChain, {true, true})
+    , tokenIssuerFace(io, m_keyChain, {true, true})
+    , consumerFace1(io, m_keyChain, {true, true})
+    , consumerFace2(io, m_keyChain, {true, true})
+    , dataOwnerFace(io, m_keyChain, {true, true})
   {
     producerFace.linkTo(aaFace);
     producerFace.linkTo(tokenIssuerFace);
